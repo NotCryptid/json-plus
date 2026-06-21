@@ -290,22 +290,12 @@ export function buildCache(jsonPath, dbPath, options = {}) {
   }
 }
 
-/** Returns true if an existing cache db is still valid for the given source file. */
-export function isCacheValid(jsonPath, dbPath) {
-  if (!fs.existsSync(dbPath)) return false;
-  const stat = fs.statSync(jsonPath);
-  let db;
-  try {
-    db = openEnv(dbPath, { readOnly: true });
-    if (db.meta.get('version') !== SCHEMA_VERSION) return false;
-    if (db.meta.get('source_size') !== stat.size) return false;
-    if (db.meta.get('source_mtime_ms') !== stat.mtimeMs) return false;
-    return true;
-  } catch {
-    return false;
-  } finally {
-    db?.root.close();
-  }
+/** Checks an already-open cache env's meta against the source file, with no extra env open/close. */
+function isEnvValid(db, stat) {
+  if (db.meta.get('version') !== SCHEMA_VERSION) return false;
+  if (db.meta.get('source_size') !== stat.size) return false;
+  if (db.meta.get('source_mtime_ms') !== stat.mtimeMs) return false;
+  return true;
 }
 
 export function openCache(dbPath) {
@@ -314,6 +304,79 @@ export function openCache(dbPath) {
 
 export function closeCache(db) {
   db.root.close();
+}
+
+// Caches open envs across calls, keyed by dbPath + access mode, so a
+// warm-cache open is a Map lookup + stat comparison instead of a fresh LMDB
+// env open - the native open() call (~0.1ms even read-only) was the floor
+// that per-call opening couldn't get under. Ownership of the env moves here:
+// callers no longer close it themselves (see closeCache below), and an
+// entry is only torn down when its source file changes underneath it.
+const envCache = new Map();
+
+function envCacheKey(dbPath, readOnly) {
+  return `${dbPath} ${readOnly ? 'ro' : 'rw'}`;
+}
+
+function evictEnvCacheEntry(dbPath) {
+  for (const mode of ['ro', 'rw']) {
+    const key = `${dbPath} ${mode}`;
+    const entry = envCache.get(key);
+    if (entry) {
+      entry.db.root.close();
+      envCache.delete(key);
+    }
+  }
+}
+
+/**
+ * Opens the cache env for `jsonPath`, rebuilding it first if missing or
+ * stale, and keeps the env open afterward (see envCache above) so repeat
+ * opens against an unchanged source file skip LMDB entirely.
+ *
+ * `options.readOnly` skips LMDB's write-lock setup on a cache miss, roughly
+ * halving that one-time open cost - pass it when the caller only intends to
+ * read (e.g. the benchmark's lookup path). Writers must omit it.
+ */
+export function openOrBuildCache(jsonPath, dbPath, options = {}) {
+  const stat = fs.statSync(jsonPath);
+  const envOpts = options.readOnly ? { readOnly: true } : {};
+  const key = envCacheKey(dbPath, options.readOnly);
+
+  if (!options.force) {
+    const entry = envCache.get(key);
+    if (entry && entry.size === stat.size && entry.mtimeMs === stat.mtimeMs) {
+      return { db: entry.db, cached: true, buildMs: 0 };
+    }
+  }
+
+  // Stale or forced: drop whatever's cached for this dbPath (in any access
+  // mode) before rebuilding/reopening, since the on-disk file is about to
+  // change underneath any of those envs.
+  evictEnvCacheEntry(dbPath);
+
+  let db;
+  let cached = false;
+  if (!options.force && fs.existsSync(dbPath)) {
+    try {
+      db = openEnv(dbPath, envOpts);
+      cached = isEnvValid(db, stat);
+    } catch {
+      db = undefined;
+    }
+    if (!cached) db?.root.close();
+  }
+
+  let buildMs = 0;
+  if (!cached) {
+    const t0 = performance.now();
+    buildCache(jsonPath, dbPath, options);
+    buildMs = performance.now() - t0;
+    db = openEnv(dbPath, envOpts);
+  }
+
+  envCache.set(key, { db, size: stat.size, mtimeMs: stat.mtimeMs });
+  return { db, cached, buildMs };
 }
 
 /** Runs fn() inside a single explicit transaction instead of one implicit transaction per statement. */

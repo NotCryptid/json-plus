@@ -56,7 +56,7 @@ function benchPlainJson(ids) {
 
 /** json-plus path: cached LMDB open (or rebuild on first/cold run), then indexed lookups. */
 function benchJsonPlus(ids, { cold }) {
-  const { data, db, cached, buildMs, openMs } = openWithStats(DATA_PATH, { force: cold });
+  const { data, db, cached, buildMs, openMs } = openWithStats(DATA_PATH, { force: cold, readOnly: true });
 
   const users = data.users;
   const t0 = performance.now();
