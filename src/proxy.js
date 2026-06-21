@@ -1,15 +1,15 @@
-import { insertNode, deleteSubtree, DEFAULT_WRITE_OPTS } from './cache.js';
+import { insertNode, deleteSubtree, DEFAULT_WRITE_OPTS, getStmt } from './cache.js';
 
 function getRow(db, id) {
-  return db.prepare('SELECT * FROM nodes WHERE id = ?').get(id);
+  return getStmt(db, 'SELECT * FROM nodes WHERE id = ?').get(id);
 }
 
 function getChild(db, parentId, key) {
-  return db.prepare('SELECT * FROM nodes WHERE parent_id = ? AND key = ?').get(parentId, key);
+  return getStmt(db, 'SELECT * FROM nodes WHERE parent_id = ? AND key = ?').get(parentId, key);
 }
 
 function getChildren(db, parentId) {
-  return db.prepare('SELECT * FROM nodes WHERE parent_id = ?').all(parentId);
+  return getStmt(db, 'SELECT * FROM nodes WHERE parent_id = ?').all(parentId);
 }
 
 function decodeScalar(row) {
@@ -130,12 +130,12 @@ function wrapArrayContainer(db, nodeId) {
 
 function wrapFlatArray(db, meta) {
   function getAt(idx) {
-    const row = db.prepare(`SELECT * FROM ${meta.table} WHERE _idx = ?`).get(idx);
+    const row = getStmt(db, `SELECT * FROM ${meta.table} WHERE _idx = ?`).get(idx);
     return row ? decodeFlatRow(row, meta.columns) : undefined;
   }
 
   function* iterate() {
-    for (const row of db.prepare(`SELECT * FROM ${meta.table} ORDER BY _idx`).iterate()) {
+    for (const row of getStmt(db, `SELECT * FROM ${meta.table} ORDER BY _idx`).iterate()) {
       yield decodeFlatRow(row, meta.columns);
     }
   }
@@ -146,11 +146,11 @@ function wrapFlatArray(db, meta) {
     },
     /** Indexed lookup on a column. Uses a SQL index when one exists (e.g. "id"). */
     where(field, value) {
-      const rows = db.prepare(`SELECT * FROM ${meta.table} WHERE "${field}" = ?`).all(value);
+      const rows = getStmt(db, `SELECT * FROM ${meta.table} WHERE "${field}" = ?`).all(value);
       return rows.map((r) => decodeFlatRow(r, meta.columns));
     },
     findById(id) {
-      const row = db.prepare(`SELECT * FROM ${meta.table} WHERE "id" = ? LIMIT 1`).get(id);
+      const row = getStmt(db, `SELECT * FROM ${meta.table} WHERE "id" = ? LIMIT 1`).get(id);
       return row ? decodeFlatRow(row, meta.columns) : undefined;
     },
     find(predicate) {

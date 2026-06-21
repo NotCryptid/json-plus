@@ -15,6 +15,26 @@ const SCHEMA = `
   CREATE INDEX idx_nodes_parent_key ON nodes(parent_id, key);
 `;
 
+// node:sqlite's prepare() re-parses and re-plans the SQL text every call, which
+// dominates cost for hot paths (property lookups, recursive inserts). Caching
+// statements per-db avoids that, at the cost of holding them open for the
+// lifetime of the DatabaseSync.
+const stmtCaches = new WeakMap();
+
+function getStmt(db, sql) {
+  let cache = stmtCaches.get(db);
+  if (!cache) {
+    cache = new Map();
+    stmtCaches.set(db, cache);
+  }
+  let stmt = cache.get(sql);
+  if (!stmt) {
+    stmt = db.prepare(sql);
+    cache.set(sql, stmt);
+  }
+  return stmt;
+}
+
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
@@ -94,9 +114,7 @@ function insertFlatRows(db, tableName, elements, columns) {
 }
 
 export function insertNode(db, parentId, key, value, opts) {
-  const insertStmt = db.prepare(
-    'INSERT INTO nodes (parent_id, key, type, value) VALUES (?, ?, ?, ?)',
-  );
+  const insertStmt = getStmt(db, 'INSERT INTO nodes (parent_id, key, type, value) VALUES (?, ?, ?, ?)');
 
   if (Array.isArray(value)) {
     if (isFlattenable(value)) {
@@ -168,7 +186,7 @@ export function isCacheValid(jsonPath, dbPath) {
   const stat = fs.statSync(jsonPath);
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
-    const get = (key) => db.prepare('SELECT value FROM __meta WHERE key = ?').get(key)?.value;
+    const get = (key) => getStmt(db, 'SELECT value FROM __meta WHERE key = ?').get(key)?.value;
     if (get('version') !== SCHEMA_VERSION) return false;
     if (get('source_size') !== String(stat.size)) return false;
     if (get('source_mtime_ms') !== String(stat.mtimeMs)) return false;
@@ -188,17 +206,17 @@ export const DEFAULT_WRITE_OPTS = { sampleSize: 200, indexFields: ['id'] };
 
 /** Recursively deletes a node and its descendants, dropping any flat table it owns. */
 export function deleteSubtree(db, nodeId) {
-  const row = db.prepare('SELECT * FROM nodes WHERE id = ?').get(nodeId);
+  const row = getStmt(db, 'SELECT * FROM nodes WHERE id = ?').get(nodeId);
   if (!row) return;
   if (row.type === 'flatarray') {
     const meta = JSON.parse(row.value);
     db.exec(`DROP TABLE IF EXISTS ${meta.table}`);
   } else if (row.type === 'object' || row.type === 'array') {
-    for (const child of db.prepare('SELECT id FROM nodes WHERE parent_id = ?').all(nodeId)) {
+    for (const child of getStmt(db, 'SELECT id FROM nodes WHERE parent_id = ?').all(nodeId)) {
       deleteSubtree(db, child.id);
     }
   }
-  db.prepare('DELETE FROM nodes WHERE id = ?').run(nodeId);
+  getStmt(db, 'DELETE FROM nodes WHERE id = ?').run(nodeId);
 }
 
-export { isPlainObject, isFlattenable };
+export { isPlainObject, isFlattenable, getStmt };

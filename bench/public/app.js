@@ -4,6 +4,12 @@ const statusEl = document.getElementById('status');
 const table = document.getElementById('results');
 const tbody = table.querySelector('tbody');
 
+function barClass(name) {
+  if (name === 'Plain JSON') return 'bar plain';
+  if (name === 'SQLite') return 'bar sqlite';
+  return 'bar';
+}
+
 function row(label, plainMs, rawSqliteMs, jsonPlusMs, maxMs) {
   const tr = document.createElement('tr');
   tr.className = 'bar-row';
@@ -30,7 +36,7 @@ function row(label, plainMs, rawSqliteMs, jsonPlusMs, maxMs) {
     cells.push(td);
 
     const bar = document.createElement('div');
-    bar.className = result.isPlain ? 'bar plain' : 'bar';
+    bar.className = barClass(result.name);
     bar.style.width = `${(result.ms / maxMs) * 100}%`;
     if (!result.isPlain) bar.style.opacity = '0.7';
     if (bars.length > 0) bar.style.marginTop = '4px';
@@ -42,7 +48,14 @@ function row(label, plainMs, rawSqliteMs, jsonPlusMs, maxMs) {
   cells.push(barTd);
 
   tr.append(...cells);
-  return tr;
+  return { tr, order: results.map((r) => r.name) };
+}
+
+function updateHeader(order) {
+  const headerCells = document.querySelectorAll('#resultsHeader th');
+  order.forEach((name, i) => {
+    headerCells[i + 1].textContent = `${name} (ms)`;
+  });
 }
 
 async function runBenchmark(cold) {
@@ -60,8 +73,11 @@ async function runBenchmark(cold) {
     const maxMs = Math.max(plain.total, jsonPlus.total, rawSqlite.lookupMs, 1);
 
     tbody.innerHTML = '';
-    tbody.appendChild(row('Lookups (lookup only)', plain.lookupMs, rawSqlite.lookupMs, jsonPlus.lookupMs, maxMs));
-    tbody.appendChild(row('Total (with cache/parse)', plain.total, jsonPlus.buildMs + jsonPlus.openMs + rawSqlite.lookupMs, jsonPlus.total, maxMs));
+    const lookupsRow = row('Lookups (lookup only)', plain.lookupMs, rawSqlite.lookupMs, jsonPlus.lookupMs, maxMs);
+    const totalRow = row('Total (with cache/parse)', plain.total, jsonPlus.buildMs + jsonPlus.openMs + rawSqlite.lookupMs, jsonPlus.total, maxMs);
+    updateHeader(lookupsRow.order);
+    tbody.appendChild(lookupsRow.tr);
+    tbody.appendChild(totalRow.tr);
     table.style.display = '';
 
     const speedup = (plain.total / jsonPlus.total).toFixed(1);

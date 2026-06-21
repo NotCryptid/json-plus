@@ -1,2 +1,2 @@
 # json-plus
-JavaScript library that makes json faster
+Very cool library that makes JSON up to 80 times faster
