@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { openWithStats, close } from '../src/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -60,6 +61,27 @@ function benchJsonPlus(ids, { cold }) {
   };
 }
 
+/** Raw SQLite path: open cache, execute raw SQL queries without proxy overhead. */
+function benchRawSqlite(ids, dbPath) {
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const rootIdStr = db.prepare("SELECT value FROM __meta WHERE key = 'root_id'").get().value;
+    const rootRow = db.prepare('SELECT * FROM nodes WHERE id = ?').get(Number(rootIdStr));
+    const usersRow = db.prepare('SELECT * FROM nodes WHERE parent_id = ? AND key = ?').get(rootRow.id, 'users');
+    const meta = JSON.parse(usersRow.value);
+
+    const t0 = performance.now();
+    const results = ids.map((id) =>
+      db.prepare(`SELECT * FROM ${meta.table} WHERE id = ? LIMIT 1`).get(id),
+    );
+    const lookupMs = performance.now() - t0;
+
+    return { lookupMs, found: results.filter(Boolean).length };
+  } finally {
+    db.close();
+  }
+}
+
 function handleApiRun(url, res) {
   const params = url.searchParams;
   const lookups = Math.min(Math.max(Number(params.get('lookups')) || 2000, 1), 100_000);
@@ -81,9 +103,11 @@ function handleApiRun(url, res) {
 
   const plain = benchPlainJson(ids);
   const jsonPlus = benchJsonPlus(ids, { cold });
+  const dbPath = `${DATA_PATH}.jsonp`;
+  const rawSqlite = benchRawSqlite(ids, dbPath);
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ count, lookups, cold, plain, jsonPlus }));
+  res.end(JSON.stringify({ count, lookups, cold, plain, jsonPlus, rawSqlite }));
 }
 
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
