@@ -1,4 +1,4 @@
-import { buildCache, isCacheValid, openCache } from './cache.js';
+import { buildCache, isCacheValid, openCache, closeCache, transaction } from './cache.js';
 import { wrapRoot, materialize, getRow } from './proxy.js';
 
 function resolveCachePath(jsonPath, options) {
@@ -6,7 +6,7 @@ function resolveCachePath(jsonPath, options) {
 }
 
 /**
- * Opens a JSON file as a sqlite-backed store, rebuilding the cache only if
+ * Opens a JSON file as an LMDB-backed store, rebuilding the cache only if
  * the source file changed (or doesn't have one yet). Returns timing info
  * alongside the data so callers can see the cache hit/miss cost.
  */
@@ -36,7 +36,7 @@ export function open(jsonPath, options = {}) {
 }
 
 export function close(db) {
-  db.close();
+  closeCache(db);
 }
 
-export { materialize, getRow };
+export { materialize, getRow, transaction };

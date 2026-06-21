@@ -1,158 +1,272 @@
-import { DatabaseSync } from 'node:sqlite';
+import { open } from 'lmdb';
 import fs from 'node:fs';
 
-const SCHEMA_VERSION = '1';
+const SCHEMA_VERSION = '3';
 
-const SCHEMA = `
-  CREATE TABLE __meta (key TEXT PRIMARY KEY, value TEXT);
-  CREATE TABLE nodes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    parent_id INTEGER,
-    key TEXT,
-    type TEXT NOT NULL,
-    value
-  );
-  CREATE INDEX idx_nodes_parent_key ON nodes(parent_id, key);
-`;
+// LMDB rejects zero-length keys, so the root can't be addressed by an empty
+// path; every node's path is anchored under this fixed, non-empty prefix.
+export const ROOT_PATH = ['$root'];
 
-// node:sqlite's prepare() re-parses and re-plans the SQL text every call, which
-// dominates cost for hot paths (property lookups, recursive inserts). Caching
-// statements per-db avoids that, at the cost of holding them open for the
-// lifetime of the DatabaseSync.
-const stmtCaches = new WeakMap();
-
-function getStmt(db, sql) {
-  let cache = stmtCaches.get(db);
-  if (!cache) {
-    cache = new Map();
-    stmtCaches.set(db, cache);
-  }
-  let stmt = cache.get(sql);
-  if (!stmt) {
-    stmt = db.prepare(sql);
-    cache.set(sql, stmt);
-  }
-  return stmt;
-}
+export const DEFAULT_WRITE_OPTS = { sampleSize: 200, indexFields: ['id'] };
 
 function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
-// An array "flattens" into its own SQL table (with real columns + indexes)
-// when every element is a plain object. That's the case that benefits most
-// from a database: point/range lookups instead of a linear scan.
+// An array "flattens" into its own table (one row per element) when every
+// element is a plain object. That's the case that benefits most from a real
+// index: point/equality lookups instead of a linear scan.
 function isFlattenable(arr) {
   return arr.length > 0 && arr.every(isPlainObject);
-}
-
-// Decides the SQL column type plus how values round-trip through it:
-// plain numbers/strings are stored natively, booleans as 0/1, and
-// objects/arrays as JSON text that gets parsed back out on read.
-function columnInfo(values) {
-  let sawNumber = false;
-  let sawBoolean = false;
-  let sawObject = false;
-  let sawString = false;
-  for (const v of values) {
-    if (v === undefined || v === null) continue;
-    if (typeof v === 'number') sawNumber = true;
-    else if (typeof v === 'boolean') sawBoolean = true;
-    else if (typeof v === 'string') sawString = true;
-    else sawObject = true;
-  }
-  if (sawObject) return { type: 'TEXT', json: true, boolean: false };
-  if (sawBoolean && !sawNumber && !sawString) return { type: 'INTEGER', json: false, boolean: true };
-  if (sawNumber && !sawString) return { type: 'REAL', json: false, boolean: false };
-  return { type: 'TEXT', json: false, boolean: false };
-}
-
-function inferColumns(elements, sampleSize) {
-  const sample = elements.slice(0, sampleSize);
-  const keys = new Set();
-  for (const el of sample) for (const k of Object.keys(el)) keys.add(k);
-  const columns = new Map();
-  for (const key of keys) {
-    columns.set(key, columnInfo(sample.map((el) => el[key])));
-  }
-  return columns;
-}
-
-function encodeColumnValue(value, info) {
-  if (value === undefined || value === null) return null;
-  if (info.json) return JSON.stringify(value);
-  if (info.boolean) return value ? 1 : 0;
-  return value;
 }
 
 function randomTableName() {
   return `flat_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function createFlatTable(db, columns, indexColumns) {
-  const tableName = randomTableName();
-  const colDefs = [...columns.entries()].map(([name, info]) => `"${name}" ${info.type}`);
-  db.exec(`CREATE TABLE ${tableName} (_idx INTEGER PRIMARY KEY, ${colDefs.join(', ')})`);
-  for (const col of indexColumns) {
-    if (columns.has(col)) {
-      db.exec(`CREATE INDEX idx_${tableName}_${col} ON ${tableName}("${col}")`);
-    }
+/** Opens (or returns the already-open handle for) a named sub-database under the cache's root env. */
+function getTable(db, name, options) {
+  let dbi = db.tables.get(name);
+  if (!dbi) {
+    dbi = db.root.openDB({ name, ...options });
+    db.tables.set(name, dbi);
   }
-  return tableName;
+  return dbi;
 }
 
-function insertFlatRows(db, tableName, elements, columns) {
-  const colNames = [...columns.keys()];
-  const placeholders = colNames.map(() => '?').join(', ');
-  const stmt = db.prepare(
-    `INSERT INTO ${tableName} (_idx, ${colNames.map((c) => `"${c}"`).join(', ')}) VALUES (?, ${placeholders})`,
-  );
+function indexTableName(table, field) {
+  return `${table}__idx_${field}`;
+}
+
+// "id" is assumed unique (like a primary key), so its index skips dupSort
+// entirely: a plain get() is a single direct B-tree lookup, while dupSort's
+// getValues() has to open/seek/close a cursor even when there's only one
+// match. Other configured index fields keep dupSort since they may
+// legitimately have repeated values (e.g. indexing a non-unique "city").
+function isUniqueField(field) {
+  return field === 'id';
+}
+
+function getIndexTable(db, table, field) {
+  const options = isUniqueField(field) ? { encoding: 'ordered-binary' } : { dupSort: true, encoding: 'ordered-binary' };
+  return getTable(db, indexTableName(table, field), options);
+}
+
+/** Looks up the single idx for `value` on a field's index, regardless of whether it's dupSort. */
+function lookupIndexValue(idxDbi, field, value) {
+  if (isUniqueField(field)) return idxDbi.get(value);
+  const [idx] = idxDbi.getValues(value);
+  return idx;
+}
+
+/** Removes one index entry, regardless of whether the dbi is dupSort. */
+function removeIndexEntry(idxDbi, field, key, idx) {
+  if (isUniqueField(field)) idxDbi.removeSync(key);
+  else idxDbi.removeSync(key, idx);
+}
+
+/** Tree nodes are addressed by path (array of keys from the root) rather than by id -
+ * this lets a parent's own record just list its children's keys, with no need for a
+ * parent_id index or an auto-increment id allocator. */
+export function getNode(db, path) {
+  return db.nodes.get(path);
+}
+
+function setNode(db, path, record) {
+  db.nodes.putSync(path, record);
+}
+
+function removeNode(db, path) {
+  db.nodes.removeSync(path);
+}
+
+export function getChild(db, parentPath, key) {
+  return getNode(db, [...parentPath, key]);
+}
+
+/** All direct children of a node, derived from its own ordered key/length list. */
+export function getChildren(db, parentPath, parentNode) {
+  const node = parentNode ?? getNode(db, parentPath);
+  if (!node) return [];
+  if (node.kind === 'object') {
+    return node.keys.map((key) => ({ key, path: [...parentPath, key] }));
+  }
+  if (node.kind === 'array') {
+    const out = [];
+    for (let i = 0; i < node.length; i += 1) out.push({ key: i, path: [...parentPath, i] });
+    return out;
+  }
+  return [];
+}
+
+function createFlatTable(db, elements, opts) {
+  const tableName = randomTableName();
+  const mainDbi = getTable(db, tableName);
+  const sample = elements[0] ?? {};
+  const indexFields = opts.indexFields.filter((f) => f in sample);
+  const indexDbis = indexFields.map((field) => getIndexTable(db, tableName, field));
+
   elements.forEach((el, idx) => {
-    const row = colNames.map((name) => encodeColumnValue(el[name], columns.get(name)));
-    stmt.run(idx, ...row);
+    mainDbi.putSync(idx, el);
+    indexFields.forEach((field, i) => {
+      if (field in el) indexDbis[i].putSync(el[field], idx);
+    });
   });
+
+  return { table: tableName, length: elements.length, indexFields };
 }
 
-export function insertNode(db, parentId, key, value, opts) {
-  const insertStmt = getStmt(db, 'INSERT INTO nodes (parent_id, key, type, value) VALUES (?, ?, ?, ?)');
+function dropTable(db, name) {
+  const dbi = getTable(db, name);
+  dbi.dropSync();
+  db.tables.delete(name);
+}
 
+export function insertNode(db, path, value, opts) {
   if (Array.isArray(value)) {
     if (isFlattenable(value)) {
-      const columns = inferColumns(value, opts.sampleSize);
-      const tableName = createFlatTable(db, columns, opts.indexFields);
-      insertFlatRows(db, tableName, value, columns);
-      const meta = JSON.stringify({
-        table: tableName,
-        length: value.length,
-        columns: [...columns.entries()].map(([name, info]) => ({ name, ...info })),
-      });
-      const { lastInsertRowid } = insertStmt.run(parentId, key, 'flatarray', meta);
-      return lastInsertRowid;
+      const meta = createFlatTable(db, value, opts);
+      setNode(db, path, { kind: 'flatarray', meta });
+      return;
     }
-    const { lastInsertRowid: id } = insertStmt.run(parentId, key, 'array', String(value.length));
-    value.forEach((el, idx) => insertNode(db, id, String(idx), el, opts));
-    return id;
+    setNode(db, path, { kind: 'array', length: value.length });
+    value.forEach((el, idx) => insertNode(db, [...path, idx], el, opts));
+    return;
   }
-
   if (isPlainObject(value)) {
-    const { lastInsertRowid: id } = insertStmt.run(parentId, key, 'object', null);
-    for (const [k, v] of Object.entries(value)) insertNode(db, id, k, v, opts);
-    return id;
+    setNode(db, path, { kind: 'object', keys: Object.keys(value) });
+    for (const [k, v] of Object.entries(value)) insertNode(db, [...path, k], v, opts);
+    return;
   }
-
-  if (value === null || value === undefined) {
-    return insertStmt.run(parentId, key, 'null', null).lastInsertRowid;
-  }
-  if (typeof value === 'boolean') {
-    return insertStmt.run(parentId, key, 'boolean', value ? 1 : 0).lastInsertRowid;
-  }
-  if (typeof value === 'number') {
-    return insertStmt.run(parentId, key, 'number', value).lastInsertRowid;
-  }
-  return insertStmt.run(parentId, key, 'string', String(value)).lastInsertRowid;
+  setNode(db, path, { kind: 'scalar', value: value === undefined ? null : value });
 }
 
-/** Builds (or rebuilds) the sqlite cache for a JSON file. This is the "expensive" step. */
+/** Recursively deletes a node and its descendants, dropping any flat tables it owns. */
+export function deleteSubtree(db, path) {
+  const node = getNode(db, path);
+  if (!node) return;
+  if (node.kind === 'flatarray') {
+    dropTable(db, node.meta.table);
+    for (const field of node.meta.indexFields) dropTable(db, indexTableName(node.meta.table, field));
+  } else {
+    for (const child of getChildren(db, path, node)) deleteSubtree(db, child.path);
+  }
+  removeNode(db, path);
+}
+
+/** Replaces whatever lives at (parentPath, key) with `value`, and keeps the parent's key list in sync. */
+export function writeChild(db, parentPath, key, value) {
+  deleteSubtree(db, [...parentPath, key]);
+  insertNode(db, [...parentPath, key], value, DEFAULT_WRITE_OPTS);
+
+  const parentNode = getNode(db, parentPath);
+  if (parentNode?.kind === 'object' && !parentNode.keys.includes(key)) {
+    setNode(db, parentPath, { ...parentNode, keys: [...parentNode.keys, key] });
+  }
+}
+
+/** Deletes (parentPath, key) entirely, including removing it from the parent's key list. */
+export function deleteChild(db, parentPath, key) {
+  deleteSubtree(db, [...parentPath, key]);
+  const parentNode = getNode(db, parentPath);
+  if (parentNode?.kind === 'object') {
+    setNode(db, parentPath, { ...parentNode, keys: parentNode.keys.filter((k) => k !== key) });
+  }
+}
+
+/** Updates the given fields on the flat-table row matching `id`. Returns whether a row was found. */
+export function updateFlatRow(db, meta, id, patch) {
+  if (!meta.indexFields.includes('id')) return false;
+  const idDbi = getIndexTable(db, meta.table, 'id');
+  const idx = lookupIndexValue(idDbi, 'id', id);
+  if (idx === undefined) return false;
+
+  const mainDbi = getTable(db, meta.table);
+  const existing = mainDbi.get(idx);
+  if (!existing) return false;
+
+  for (const field of meta.indexFields) {
+    if (field in patch && patch[field] !== existing[field]) {
+      const fieldDbi = getIndexTable(db, meta.table, field);
+      removeIndexEntry(fieldDbi, field, existing[field], idx);
+      fieldDbi.putSync(patch[field], idx);
+    }
+  }
+  mainDbi.putSync(idx, { ...existing, ...patch });
+  return true;
+}
+
+/** Deletes the flat-table row matching `id`. Returns whether a row was found. */
+export function deleteFlatRow(db, meta, id) {
+  if (!meta.indexFields.includes('id')) return false;
+  const idDbi = getIndexTable(db, meta.table, 'id');
+  const idx = lookupIndexValue(idDbi, 'id', id);
+  if (idx === undefined) return false;
+
+  const mainDbi = getTable(db, meta.table);
+  const existing = mainDbi.get(idx);
+  if (!existing) return false;
+
+  mainDbi.removeSync(idx);
+  for (const field of meta.indexFields) {
+    if (field in existing) {
+      const fieldDbi = getIndexTable(db, meta.table, field);
+      removeIndexEntry(fieldDbi, field, existing[field], idx);
+    }
+  }
+  return true;
+}
+
+/** Persists an updated flatarray meta blob (e.g. after a length change) back onto its node. */
+export function persistFlatArrayMeta(db, path, meta) {
+  setNode(db, path, { kind: 'flatarray', meta });
+}
+
+/** Iterates a flat table's rows in original array order. */
+export function iterateFlatTable(db, meta) {
+  const mainDbi = getTable(db, meta.table);
+  return mainDbi.getRange({}).map(({ value }) => value);
+}
+
+export function getFlatRowAt(db, meta, idx) {
+  return getTable(db, meta.table).get(idx);
+}
+
+export function whereFlatRows(db, meta, field, value) {
+  if (!meta.indexFields.includes(field)) {
+    return [...iterateFlatTable(db, meta)].filter((row) => row[field] === value);
+  }
+  const mainDbi = getTable(db, meta.table);
+  const idxDbi = getIndexTable(db, meta.table, field);
+  if (isUniqueField(field)) {
+    const idx = idxDbi.get(value);
+    const row = idx === undefined ? undefined : mainDbi.get(idx);
+    return row ? [row] : [];
+  }
+  const idxs = [...idxDbi.getValues(value)];
+  return idxs.map((idx) => mainDbi.get(idx)).filter(Boolean);
+}
+
+/** Single-row equality lookup, skipping the array allocation whereFlatRows pays for the multi-match case. */
+export function findFlatRow(db, meta, field, value) {
+  if (!meta.indexFields.includes(field)) {
+    for (const row of iterateFlatTable(db, meta)) {
+      if (row[field] === value) return row;
+    }
+    return undefined;
+  }
+  const idx = lookupIndexValue(getIndexTable(db, meta.table, field), field, value);
+  return idx === undefined ? undefined : getTable(db, meta.table).get(idx);
+}
+
+function openEnv(dbPath, options = {}) {
+  const root = open({ path: dbPath, ...options });
+  const meta = root.openDB({ name: '__meta' });
+  const nodes = root.openDB({ name: '__nodes' });
+  return { root, meta, nodes, tables: new Map() };
+}
+
+/** Builds (or rebuilds) the LMDB cache for a JSON file. This is the "expensive" step. */
 export function buildCache(jsonPath, dbPath, options = {}) {
   const opts = {
     sampleSize: options.sampleSize ?? 200,
@@ -160,23 +274,19 @@ export function buildCache(jsonPath, dbPath, options = {}) {
   };
 
   const stat = fs.statSync(jsonPath);
-  const raw = fs.readFileSync(jsonPath, 'utf8');
-  const data = JSON.parse(raw);
+  const data = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
 
   fs.rmSync(dbPath, { force: true });
-  const db = new DatabaseSync(dbPath);
+  const db = openEnv(dbPath);
   try {
-    db.exec('PRAGMA journal_mode = WAL');
-    db.exec(SCHEMA);
-    db.exec('BEGIN');
-    const rootId = insertNode(db, null, null, data, opts);
-    db.prepare('INSERT INTO __meta (key, value) VALUES (?, ?)').run('root_id', String(rootId));
-    db.prepare('INSERT INTO __meta (key, value) VALUES (?, ?)').run('source_size', String(stat.size));
-    db.prepare('INSERT INTO __meta (key, value) VALUES (?, ?)').run('source_mtime_ms', String(stat.mtimeMs));
-    db.prepare('INSERT INTO __meta (key, value) VALUES (?, ?)').run('version', SCHEMA_VERSION);
-    db.exec('COMMIT');
+    db.root.transactionSync(() => {
+      insertNode(db, ROOT_PATH, data, opts);
+      db.meta.putSync('version', SCHEMA_VERSION);
+      db.meta.putSync('source_size', stat.size);
+      db.meta.putSync('source_mtime_ms', stat.mtimeMs);
+    });
   } finally {
-    db.close();
+    db.root.close();
   }
 }
 
@@ -184,39 +294,31 @@ export function buildCache(jsonPath, dbPath, options = {}) {
 export function isCacheValid(jsonPath, dbPath) {
   if (!fs.existsSync(dbPath)) return false;
   const stat = fs.statSync(jsonPath);
-  const db = new DatabaseSync(dbPath, { readOnly: true });
+  let db;
   try {
-    const get = (key) => getStmt(db, 'SELECT value FROM __meta WHERE key = ?').get(key)?.value;
-    if (get('version') !== SCHEMA_VERSION) return false;
-    if (get('source_size') !== String(stat.size)) return false;
-    if (get('source_mtime_ms') !== String(stat.mtimeMs)) return false;
+    db = openEnv(dbPath, { readOnly: true });
+    if (db.meta.get('version') !== SCHEMA_VERSION) return false;
+    if (db.meta.get('source_size') !== stat.size) return false;
+    if (db.meta.get('source_mtime_ms') !== stat.mtimeMs) return false;
     return true;
   } catch {
     return false;
   } finally {
-    db.close();
+    db?.root.close();
   }
 }
 
 export function openCache(dbPath) {
-  return new DatabaseSync(dbPath);
+  return openEnv(dbPath);
 }
 
-export const DEFAULT_WRITE_OPTS = { sampleSize: 200, indexFields: ['id'] };
-
-/** Recursively deletes a node and its descendants, dropping any flat table it owns. */
-export function deleteSubtree(db, nodeId) {
-  const row = getStmt(db, 'SELECT * FROM nodes WHERE id = ?').get(nodeId);
-  if (!row) return;
-  if (row.type === 'flatarray') {
-    const meta = JSON.parse(row.value);
-    db.exec(`DROP TABLE IF EXISTS ${meta.table}`);
-  } else if (row.type === 'object' || row.type === 'array') {
-    for (const child of getStmt(db, 'SELECT id FROM nodes WHERE parent_id = ?').all(nodeId)) {
-      deleteSubtree(db, child.id);
-    }
-  }
-  getStmt(db, 'DELETE FROM nodes WHERE id = ?').run(nodeId);
+export function closeCache(db) {
+  db.root.close();
 }
 
-export { isPlainObject, isFlattenable, getStmt };
+/** Runs fn() inside a single explicit transaction instead of one implicit transaction per statement. */
+export function transaction(db, fn) {
+  return db.root.transactionSync(fn);
+}
+
+export { isPlainObject, isFlattenable };

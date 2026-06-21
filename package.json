@@ -1,9 +1,12 @@
 {
   "name": "json-plus",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "description": "Makes JSON a hell of a lot faster.",
   "type": "module",
   "main": "src/index.js",
+  "files": [
+    "src"
+  ],
   "engines": {
     "node": ">=22.5.0"
   },
@@ -12,5 +15,8 @@
     "bench": "node bench/server.js",
     "test": "node --test"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "lmdb": "^3.5.6"
+  }
 }
