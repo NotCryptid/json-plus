@@ -1,5 +1,6 @@
 import { open } from 'lmdb';
 import fs from 'node:fs';
+import os from 'node:os';
 
 const SCHEMA_VERSION = '3';
 
@@ -278,8 +279,20 @@ export function findFlatRow(db, meta, field, value) {
 // disk-flush cost per transaction (tens of ms on some platforms) that
 // otherwise dominates small write/delete batches regardless of how many
 // operations they contain.
+//
+// Windows-only: without useWritemap, LMDB's commit path (mdb_page_flush)
+// writes every dirty page with its own WriteFile syscall, one page at a
+// time - Unix builds batch many dirty pages per pwritev call instead. With
+// useWritemap, dirty pages are already in the mapped view at commit time,
+// so that per-page write loop is skipped entirely. That's normally a
+// durability tradeoff not worth making, but this cache has no durability
+// requirement to begin with (see above), so it's a pure win here - and it's
+// the dominant cost behind writes/deletes being an order of magnitude
+// slower on Windows than on macOS/Linux for this workload.
+const USE_WRITEMAP = os.platform() === 'win32';
+
 function openEnv(dbPath, options = {}) {
-  const root = open({ path: dbPath, noSync: true, ...options });
+  const root = open({ path: dbPath, noSync: true, noMemInit: true, useWritemap: USE_WRITEMAP, ...options });
   const meta = root.openDB({ name: '__meta' });
   const nodes = root.openDB({ name: '__nodes' });
   return { root, meta, nodes, tables: new Map() };
