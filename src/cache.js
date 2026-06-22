@@ -271,8 +271,15 @@ export function findFlatRow(db, meta, field, value) {
   return idx === undefined ? undefined : getTable(db, meta.table).get(idx);
 }
 
+// This env is a derived cache, not a source of truth (the JSON file is, and
+// a stale/missing cache just gets rebuilt - see openOrBuildCache). So it
+// skips LMDB's per-commit fsync: durability would only protect writes the
+// source file can already regenerate, while the fsync itself is a fixed
+// disk-flush cost per transaction (tens of ms on some platforms) that
+// otherwise dominates small write/delete batches regardless of how many
+// operations they contain.
 function openEnv(dbPath, options = {}) {
-  const root = open({ path: dbPath, ...options });
+  const root = open({ path: dbPath, noSync: true, ...options });
   const meta = root.openDB({ name: '__meta' });
   const nodes = root.openDB({ name: '__nodes' });
   return { root, meta, nodes, tables: new Map() };
