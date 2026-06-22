@@ -15,7 +15,7 @@ function barClass(name) {
 // (per-run) column order, and each row scales its own bars independently so a
 // row of millisecond-scale numbers isn't flattened by a row of second-scale ones.
 // `logScale` switches the bar width from linear to log(1+ms): build/open costs
-// for SQLite and JSON Plus are routinely 100-1000x smaller than plain JSON's
+// for SQLite and JSON Mach are routinely 100-1000x smaller than plain JSON's
 // parse cost, and a linear scale reserves nearly the whole row as empty space
 // for a "max" that the smaller two will never approach.
 function row(label, valuesByName, order, { logScale = false } = {}) {
@@ -89,7 +89,7 @@ async function runBenchmark(cold) {
     const secretTotal = {
       'Plain JSON': plainBuild + plain.lookupMs + plainWrite.total + plainDelete.total,
       SQLite: rawSqliteBuild + rawSqlite.lookupMs + rawSqliteWrite.total + rawSqliteDelete.total,
-      'JSON Plus': jsonPlusBuild + jsonPlus.lookupMs + jsonPlusWrite.total + jsonPlusDelete.total,
+      'JSON Mach': jsonPlusBuild + jsonPlus.lookupMs + jsonPlusWrite.total + jsonPlusDelete.total,
     };
     const order = Object.keys(secretTotal).sort((a, b) => secretTotal[a] - secretTotal[b]);
 
@@ -97,23 +97,23 @@ async function runBenchmark(cold) {
     updateHeader(order);
     const buildRow = row(
       'Cache build/open',
-      { 'Plain JSON': plainBuild, SQLite: rawSqliteBuild, 'JSON Plus': jsonPlusBuild },
+      { 'Plain JSON': plainBuild, SQLite: rawSqliteBuild, 'JSON Mach': jsonPlusBuild },
       order,
       { logScale: true },
     );
     const lookupsRow = row(
       'Lookups',
-      { 'Plain JSON': plain.lookupMs, SQLite: rawSqlite.lookupMs, 'JSON Plus': jsonPlus.lookupMs },
+      { 'Plain JSON': plain.lookupMs, SQLite: rawSqlite.lookupMs, 'JSON Mach': jsonPlus.lookupMs },
       order,
     );
     const writeRow = row(
       'Write',
-      { 'Plain JSON': plainWrite.total, SQLite: rawSqliteWrite.total, 'JSON Plus': jsonPlusWrite.total },
+      { 'Plain JSON': plainWrite.total, SQLite: rawSqliteWrite.total, 'JSON Mach': jsonPlusWrite.total },
       order,
     );
     const deleteRow = row(
       'Delete',
-      { 'Plain JSON': plainDelete.total, SQLite: rawSqliteDelete.total, 'JSON Plus': jsonPlusDelete.total },
+      { 'Plain JSON': plainDelete.total, SQLite: rawSqliteDelete.total, 'JSON Mach': jsonPlusDelete.total },
       order,
     );
     tbody.appendChild(buildRow.tr);
@@ -123,9 +123,9 @@ async function runBenchmark(cold) {
     table.style.display = '';
 
     const speedup = (plain.lookupMs / jsonPlus.lookupMs).toFixed(1);
-    statusEl.textContent = `${count.toLocaleString()} records, ${lookups} operations. JSON Plus cache ${
+    statusEl.textContent = `${count.toLocaleString()} records, ${lookups} operations. JSON Mach cache ${
       jsonPlus.cached ? 'hit' : 'rebuilt (' + jsonPlus.buildMs.toFixed(1) + 'ms)'
-    }. JSON Plus is ${speedup}x faster than plain JSON parsing.`;
+    }. JSON Mach is ${speedup}x faster than plain JSON parsing.`;
   } catch (err) {
     statusEl.textContent = `Error: ${err.message}`;
   } finally {

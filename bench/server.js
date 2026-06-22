@@ -12,7 +12,7 @@ import { buildSqliteTable, isSqliteTableValid, SQLITE_TABLE } from './sqlite-tab
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const DATA_PATH = path.join(__dirname, '..', 'data', 'sample.json');
-const DB_PATH = `${DATA_PATH}.jsonp`;
+const DB_PATH = `${DATA_PATH}.jsonm`;
 // A separate, plain SQLite table just for the "raw SQLite" comparison column -
 // json-plus's own cache (DB_PATH) is LMDB now, so this is built independently.
 const SQLITE_PATH = `${DATA_PATH}.sqlite`;
