@@ -14,7 +14,7 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 const DATA_PATH = path.join(__dirname, '..', 'data', 'sample.json');
 const DB_PATH = `${DATA_PATH}.jsonm`;
 // A separate, plain SQLite table just for the "raw SQLite" comparison column -
-// json-plus's own cache (DB_PATH) is LMDB now, so this is built independently.
+// json-mach's own cache (DB_PATH) is LMDB now, so this is built independently.
 const SQLITE_PATH = `${DATA_PATH}.sqlite`;
 const PORT = Number(process.env.PORT) || 8080;
 
@@ -54,7 +54,7 @@ function benchPlainJson(ids) {
   return { parseMs, lookupMs, total: parseMs + lookupMs, found: results.filter(Boolean).length };
 }
 
-/** json-plus path: cached LMDB open (or rebuild on first/cold run), then indexed lookups. */
+/** json-mach path: cached LMDB open (or rebuild on first/cold run), then indexed lookups. */
 function benchJsonPlus(ids, { cold }) {
   const { data, db, cached, buildMs, openMs } = openWithStats(DATA_PATH, { force: cold, readOnly: true });
 
@@ -94,7 +94,7 @@ function benchRawSqlite(ids) {
 
 function scratchPath(suffix) {
   const tag = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  return path.join(os.tmpdir(), `json-plus-bench-${tag}${suffix}`);
+  return path.join(os.tmpdir(), `json-mach-bench-${tag}${suffix}`);
 }
 
 function cleanupLmdbScratch(dbPath) {
@@ -117,7 +117,7 @@ function benchPlainJsonWrite(ids) {
     const user = byId.get(id);
     if (user) user.score = 0;
   }
-  fs.writeFileSync(path.join(os.tmpdir(), 'json-plus-bench-plain-write.json'), JSON.stringify(doc));
+  fs.writeFileSync(path.join(os.tmpdir(), 'json-mach-bench-plain-write.json'), JSON.stringify(doc));
   const writeMs = performance.now() - t1;
 
   return { parseMs, writeMs, total: parseMs + writeMs };
@@ -132,13 +132,13 @@ function benchPlainJsonDelete(ids) {
   const idSet = new Set(ids);
   const t1 = performance.now();
   doc.users = doc.users.filter((u) => !idSet.has(u.id));
-  fs.writeFileSync(path.join(os.tmpdir(), 'json-plus-bench-plain-delete.json'), JSON.stringify(doc));
+  fs.writeFileSync(path.join(os.tmpdir(), 'json-mach-bench-plain-delete.json'), JSON.stringify(doc));
   const deleteMs = performance.now() - t1;
 
   return { parseMs, deleteMs, total: parseMs + deleteMs };
 }
 
-/** json-plus path: all updates batched in a single transaction against a scratch copy of the cache. */
+/** json-mach path: all updates batched in a single transaction against a scratch copy of the cache. */
 function benchJsonPlusWrite(ids) {
   const dbPath = scratchPath('.jsonm');
   fs.copyFileSync(DB_PATH, dbPath);
@@ -157,7 +157,7 @@ function benchJsonPlusWrite(ids) {
   }
 }
 
-/** json-plus path: all deletes batched in a single transaction against a scratch copy of the cache. */
+/** json-mach path: all deletes batched in a single transaction against a scratch copy of the cache. */
 function benchJsonPlusDelete(ids) {
   const dbPath = scratchPath('.jsonm');
   fs.copyFileSync(DB_PATH, dbPath);
@@ -311,5 +311,5 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`json-plus benchmark running at http://localhost:${PORT}`);
+  console.log(`json-mach benchmark running at http://localhost:${PORT}`);
 });

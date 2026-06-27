@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 export function tempJsonPath(data) {
-  const file = path.join(os.tmpdir(), `json-plus-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+  const file = path.join(os.tmpdir(), `json-mach-test-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
   fs.writeFileSync(file, JSON.stringify(data));
   return file;
 }

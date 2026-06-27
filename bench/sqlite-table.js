@@ -1,7 +1,7 @@
-// json-plus's own cache is now LMDB-backed (see src/cache.js), but the
+// json-mach's own cache is now LMDB-backed (see src/cache.js), but the
 // benchmark still wants a "raw SQLite" comparison column. This is a small,
 // self-contained SQLite table builder used only by bench/server.js - it has
-// no relationship to json-plus's storage format anymore.
+// no relationship to json-mach's storage format anymore.
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 
